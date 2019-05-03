@@ -76,4 +76,6 @@ class hparams:
     amsgrad=False
     weight_decay = 0.0
     fix_learning_rate = None # modify if one wants to use a fixed learning rate, else set to None to use noam learning rate
+
+    
     #-----------------

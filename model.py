@@ -8,6 +8,8 @@ from utils import num_params, mulaw_quantize, inv_mulaw_quantize
 
 from tqdm import tqdm
 import numpy as np
+import time
+import torch.multiprocessing as mp
 
 class ResBlock(nn.Module) :
     def __init__(self, dims) :
@@ -86,7 +88,7 @@ class UpsampleNetwork(nn.Module) :
 
 class Model(nn.Module) :
     def __init__(self, rnn_dims, fc_dims, bits, pad, upsample_factors,
-                 feat_dims, compute_dims, res_out_dims, res_blocks):
+                 feat_dims, compute_dims, res_out_dims, res_blocks, cuda = True):
         super().__init__()
         if hp.input_type == 'raw':
             self.n_classes = 2
@@ -109,12 +111,18 @@ class Model(nn.Module) :
         self.fc1 = nn.Linear(rnn_dims + self.aux_dims, fc_dims)
         self.fc2 = nn.Linear(fc_dims + self.aux_dims, fc_dims)
         self.fc3 = nn.Linear(fc_dims, self.n_classes)
+
+        self._cuda = cuda
         num_params(self)
     
     def forward(self, x, mels) :
         bsize = x.size(0)
-        h1 = torch.zeros(1, bsize, self.rnn_dims).cuda()
-        h2 = torch.zeros(1, bsize, self.rnn_dims).cuda()
+        h1 = torch.zeros(1, bsize, self.rnn_dims)
+        h2 = torch.zeros(1, bsize, self.rnn_dims)
+        if self._cuda:
+            h1 = h1.cuda()
+            h2 = h2.cuda()
+
         mels, aux = self.upsample(mels)
         
         aux_idx = [self.aux_dims * i for i in range(5)]
@@ -162,12 +170,19 @@ class Model(nn.Module) :
         rnn1 = self.get_gru_cell(self.rnn1)
         rnn2 = self.get_gru_cell(self.rnn2)
         
-        with torch.no_grad() :
-            x = torch.zeros(1, 1).cuda()
-            h1 = torch.zeros(1, self.rnn_dims).cuda()
-            h2 = torch.zeros(1, self.rnn_dims).cuda()
-            
-            mels = torch.FloatTensor(mels).cuda().unsqueeze(0)
+        with torch.no_grad():
+            x = torch.zeros(1, 1)
+            h1 = torch.zeros(1, self.rnn_dims)
+            h2 = torch.zeros(1, self.rnn_dims)          
+
+            if self._cuda:
+                x = x.cuda()
+                h1 = h1.cuda()
+                h2 = h2.cuda()
+                mels = torch.cuda.FloatTensor(mels).unsqueeze(0)
+            else:
+                mels = torch.FloatTensor(mels).unsqueeze(0)
+
             mels, aux = self.upsample(mels)
             
             aux_idx = [self.aux_dims * i for i in range(5)]
@@ -217,7 +232,12 @@ class Model(nn.Module) :
                     distrib = torch.distributions.Categorical(posterior)
                     sample = inv_mulaw_quantize(distrib.sample(), hp.mulaw_quantize_channels, True)
                 output.append(sample.view(-1))
-                x = torch.FloatTensor([[sample]]).cuda()
+
+
+                x = torch.FloatTensor([[sample]])
+                if self._cuda:
+                    x = x.cuda()
+
         output = torch.stack(output).cpu().numpy()
         self.train()
         return output
@@ -234,13 +254,20 @@ class Model(nn.Module) :
         assert len(mels.shape) == 3, "mels should have shape [batch_size x 80 x mel_length]"
         
         with torch.no_grad() :
-            x = torch.zeros(b_size, 1).cuda()
-            h1 = torch.zeros(b_size, self.rnn_dims).cuda()
-            h2 = torch.zeros(b_size, self.rnn_dims).cuda()
+            x = torch.zeros(b_size, 1)
+            h1 = torch.zeros(b_size, self.rnn_dims)
+            h2 = torch.zeros(b_size, self.rnn_dims)
             
-            mels = torch.FloatTensor(mels).cuda()
+            if self._cuda:
+                x = x.cuda()
+                h1 = h1.cuda()
+                h2 = h2.cuda()
+                mels = torch.cuda.FloatTensor(mels)                
+            else:
+                mels = torch.FloatTensor(mels)
+
             mels, aux = self.upsample(mels)
-            
+
             aux_idx = [self.aux_dims * i for i in range(5)]
             a1 = aux[:, :, aux_idx[0]:aux_idx[1]]
             a2 = aux[:, :, aux_idx[1]:aux_idx[2]]
@@ -331,11 +358,90 @@ def no_test_build_model():
     print(vars(model))
 
 
-def test_batch_generate():
+def test_batch_generate(gpu = True, batch_size = 10):
     model = Model(hp.rnn_dims, hp.fc_dims, hp.bits,
         hp.pad, hp.upsample_factors, hp.num_mels,
-        hp.compute_dims, hp.res_out_dims, hp.res_blocks).cuda()
+        hp.compute_dims, hp.res_out_dims, hp.res_blocks, gpu)
+
+    batch_mel = torch.rand(batch_size, 80, 200)
+
+    if gpu:
+        model = model.cuda()
+        batch_mel = batch_mel.cuda()
+    else:
+        model = model.cpu()
+
     print(vars(model))
-    batch_mel = torch.rand(3, 80, 100)
+    start = time.time()
+        
     output = model.batch_generate(batch_mel)
-    print(output.shape)
+    end = time.time()
+
+    
+    print('response time: ', end - start)
+    print('output shape:', output.shape)
+    print('throughput: ', output.shape[0] / (end - start))
+
+def generate_sample(model, mel):
+    start = time.time()
+    model.generate(mel)
+    end = time.time()
+    print('response time: ', end - start)
+
+def single_test_generate(gpu = True, mprocess = False, batch_size = 10):
+        
+    model = Model(hp.rnn_dims, hp.fc_dims, hp.bits,
+        hp.pad, hp.upsample_factors, hp.num_mels,
+        hp.compute_dims, hp.res_out_dims, hp.res_blocks, gpu)
+    
+
+    if gpu:
+        model = model.cuda()        
+    else:
+        model = model.cpu()
+
+    if mprocess:
+        model.share_memory()
+        processes = []
+
+    print(vars(model))
+    start = time.time()
+
+    for i in range(batch_size):
+        mel = torch.rand(80, 400)
+        if gpu:
+            mel = mel.cuda() 
+
+        if mprocess:
+            p = mp.Process(target = generate_sample, args=(model, mel,))
+            p.start()
+            processes.append(p)
+        else:
+            generate_sample(model, mel)
+
+    if mprocess:
+        for i in range(batch_size):
+            processes[i].join()        
+    
+    end = time.time()
+    
+    print('response time: ', end - start)
+    print('throughput: ', 94815 * batch_size / (end - start))
+
+if __name__=="__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mprocess", help="multiprocessing for inference", action="store_true")
+    parser.add_argument("--cpu", help="cpu for inference", action="store_true")
+    parser.add_argument("--batch", help="random batch inference", action="store_true")
+    parser.add_argument("--batch_size", default=10, type=int)
+
+    args = parser.parse_args()
+
+    if args.batch:
+        test_batch_generate(False if args.cpu else True, args.batch_size)
+    else:
+        single_test_generate(False if args.cpu else True, args.mprocess, args.batch_size)
+
+
+
